@@ -1,13 +1,14 @@
-FROM golang:1.20rc1-bullseye as build-env
+FROM golang:1.21-bookworm AS build-env
 
-ENV GO111MODULE=on
-
-COPY . /app
 WORKDIR /app
 
-RUN ls -lahR && go mod download && go build -o /vnc-recorder
+# Cache dependencies separately from source code.
+COPY go.mod go.sum ./
+RUN go mod download
 
-FROM linuxserver/ffmpeg:version-4.4-cli
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /vnc-recorder
+
+FROM linuxserver/ffmpeg:version-6.1.1-cli
 COPY --from=build-env /vnc-recorder /
 ENTRYPOINT ["/vnc-recorder"]
-CMD [""]

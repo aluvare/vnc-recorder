@@ -1,34 +1,59 @@
+// Package main implements vnc-recorder, a tool that connects to a VNC server
+// and records the screen to an MP4 video file using ffmpeg.
+//
+// Architecture:
+//
+//	main() -> recorder() -> runRecordingSession()
+//	                 ^--- reconnection loop with exponential backoff
+//
+//	runRecordingSession():
+//	  1. TCP connect + VNC handshake
+//	  2. Start ffmpeg encoder (goroutine)
+//	  3. Start frame capture (goroutine)
+//	  4. Main select loop: VNC events, encoder errors, split ticks, signals
+//
+// Error handling strategy:
+//   - VNC disconnections: return error to outer loop, reconnect with backoff.
+//   - Resolution changes: detected via EOF, treated as reconnectable error.
+//   - Encoder errors: close session, upload partial file, reconnect.
+//   - S3 upload failures: retried in background (see upload.go), never block recording.
+//   - Signals (SIGINT/SIGTERM/SIGHUP/SIGQUIT): graceful shutdown via context cancellation.
+//
+// Split mode:
+//   When --splitfile > 0, the output file is rotated every N minutes.
+//   The VNC connection is kept alive; only the encoder is swapped.
+//   Old files are uploaded in the background.
 package main
 
 import (
 	"context"
 	"fmt"
-	vnc "github.com/amitbet/vnc2video"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
 	"net"
-
 	"os"
 	"os/exec"
 	"os/signal"
 	"path"
+	"strings"
 	"syscall"
 	"time"
-	"strconv"
-	"strings"
 
-	"errors"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	vnc "github.com/amitbet/vnc2video"
+	"github.com/saily/vnc-recorder/logging"
+	"github.com/urfave/cli/v2"
 )
+
+const version = "0.5.0"
+
+// log is the package-level logger, initialised in recorder().
+var log *logging.Logger
 
 func main() {
 	app := &cli.App{
 		Name:    path.Base(os.Args[0]),
 		Usage:   "Connect to a vnc server and record the screen to a video.",
-		Version: "0.4.2",
+		Version: version,
 		Authors: []*cli.Author{
-			&cli.Author{
+			{
 				Name:  "Daniel Widerin",
 				Email: "daniel@widerin.net",
 			},
@@ -55,7 +80,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:    "password",
-				Value:   "secret",
+				Value:   "",
 				Usage:   "Password to connect to the VNC host",
 				EnvVars: []string{"VR_VNC_PASSWORD"},
 			},
@@ -80,7 +105,7 @@ func main() {
 			&cli.IntFlag{
 				Name:    "splitfile",
 				Value:   0,
-				Usage:   "Mins to split file.",
+				Usage:   "Minutes to split file.",
 				EnvVars: []string{"VR_SPLIT_OUTFILE"},
 			},
 			&cli.StringFlag{
@@ -122,50 +147,141 @@ func main() {
 			&cli.BoolFlag{
 				Name:    "debug",
 				Value:   false,
-				Usage:   "Debug.",
+				Usage:   "Enable debug logging.",
 				EnvVars: []string{"VR_DEBUG"},
 			},
 		},
 	}
+
 	if err := app.Run(os.Args); err != nil {
-		logrus.WithError(err).Fatal("recording failed.")
+		if log != nil {
+			log.Errorf("recording failed: %v", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "recording failed: %v\n", err)
+		}
+		os.Exit(1)
 	}
 }
 
-//func vcodecRun(c *cli.Context, vcodec *X264ImageCustomEncoder, ccflags *vnc.ClientConfig, screenImage *vnc.VncCanvas, vncConnection *vnc.ClientConn, errorCh chan error, cchClient chan vnc.ClientMessage, cchServer chan vnc.ServerMessage, outfile string) {
-func vcodecRun(vcodec *X264ImageCustomEncoder, c *cli.Context, outfileName string) error {
-	address := fmt.Sprintf("%s:%d", c.String("host"), c.Int("port"))
+// recorder is the main entry point called by the CLI framework.
+// It initialises logging, validates configuration, sets up signal handling,
+// and runs the recording loop with automatic reconnection.
+func recorder(c *cli.Context) error {
+	log = logging.Default()
+	defer log.Close()
+
+	if c.Bool("debug") {
+		log.SetLevel(logging.LevelDebug)
+	}
+
+	log.Infof("vnc-recorder starting (version=%s)", version)
+
+	// Validate ffmpeg availability before attempting any recording.
+	ffmpegPath, err := exec.LookPath(c.String("ffmpeg"))
+	if err != nil {
+		return fmt.Errorf("ffmpeg binary not found: %w", err)
+	}
+	log.Infof("ffmpeg found: %s", ffmpegPath)
+
+	// S3 setup (optional — only when s3_endpoint is configured).
+	var uploader *s3Uploader
+	if c.String("s3_endpoint") != "" {
+		if c.Int("splitfile") == 0 {
+			return fmt.Errorf("S3 upload requires --splitfile > 0")
+		}
+		uploader, err = newS3Uploader(c, log)
+		if err != nil {
+			return fmt.Errorf("S3 setup failed: %w", err)
+		}
+	}
+
+	// Graceful shutdown: signals cancel the context, which propagates to
+	// all recording goroutines without using panic or os.Exit.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		sig := <-sigCh
+		log.Infof("signal received: %v, initiating shutdown", sig)
+		cancel()
+	}()
+
+	// Reconnection loop with exponential backoff.
+	// On each session failure, we wait progressively longer before retrying
+	// (1s -> 2s -> 4s -> ... -> 30s max). Backoff resets on successful sessions.
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		// Check for cancellation before starting a new session.
+		select {
+		case <-ctx.Done():
+			log.Info("shutdown complete")
+			return nil
+		default:
+		}
+
+		err := runRecordingSession(ctx, c, ffmpegPath, uploader)
+		if ctx.Err() != nil {
+			log.Info("shutdown complete")
+			return nil
+		}
+
+		if err != nil {
+			log.Warnf("recording session ended: %v, reconnecting in %v", err, backoff)
+			select {
+			case <-time.After(backoff):
+				backoff = minDuration(backoff*2, maxBackoff)
+			case <-ctx.Done():
+				log.Info("shutdown complete")
+				return nil
+			}
+		} else {
+			// Successful session (shouldn't normally happen) — reset backoff.
+			backoff = time.Second
+		}
+	}
+}
+
+// runRecordingSession handles a single VNC connection lifetime:
+// connect, negotiate, record, and return on error or cancellation.
+//
+// In split mode, the VNC connection is kept alive while output files
+// are rotated every N minutes. The encoder is swapped without reconnecting.
+func runRecordingSession(ctx context.Context, c *cli.Context, ffmpegPath string, uploader *s3Uploader) error {
+	address := net.JoinHostPort(c.String("host"), fmt.Sprintf("%d", c.Int("port")))
+
+	// --- TCP connection ---
+	log.Infof("connecting to VNC: %s", address)
 	dialer, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
-		logrus.WithError(err).Error("connection to VNC host failed.")
-		return err
+		return fmt.Errorf("TCP connection to %s failed: %w", address, err)
 	}
 	defer dialer.Close()
+	log.Infof("TCP connection established: %s", address)
 
-	logrus.WithField("address", address).Info("connection established.")
-
-	// Negotiate connection with the server.
+	// --- VNC handshake ---
 	cchServer := make(chan vnc.ServerMessage)
 	cchClient := make(chan vnc.ClientMessage)
 	errorCh := make(chan error)
-	errorCh2 := make(chan error)
 
+	// Password handling: empty string means no auth.
+	// Fixed: old code compared against default "secret", which meant
+	// users who genuinely wanted "secret" as their password couldn't use it.
+	password := c.String("password")
 	var secHandlers []vnc.SecurityHandler
-
-	var password string
-
-	if c.String("password") != "secret" {
-		password = c.String("password")
-	}
-
 	if password == "" {
 		secHandlers = []vnc.SecurityHandler{
 			&vnc.ClientAuthNone{},
 		}
+		log.Debug("using VNC auth: none")
 	} else {
 		secHandlers = []vnc.SecurityHandler{
 			&vnc.ClientAuthVNC{Password: []byte(password)},
 		}
+		log.Debug("using VNC auth: password")
 	}
 
 	ccflags := &vnc.ClientConfig{
@@ -189,26 +305,26 @@ func vcodecRun(vcodec *X264ImageCustomEncoder, c *cli.Context, outfileName strin
 		ErrorCh: errorCh,
 	}
 
-	vncConnection, err := vnc.Connect(context.Background(), dialer, ccflags)
-	defer vncConnection.Close()
+	// Fixed: old code had `defer vncConn.Close()` BEFORE the error check,
+	// causing a nil pointer dereference if Connect failed.
+	vncConn, err := vnc.Connect(ctx, dialer, ccflags)
 	if err != nil {
-		logrus.WithError(err).Error("connection negotiation to VNC host failed.")
-		return err
+		return fmt.Errorf("VNC negotiation with %s failed: %w", address, err)
 	}
-	screenImage := vncConnection.Canvas
+	defer vncConn.Close()
+	log.Infof("VNC session established: %s (%dx%d)", address, vncConn.Width(), vncConn.Height())
 
-	//goland:noinspection GoUnhandledErrorResult
-	go vcodec.Run(outfileName + ".mp4")
+	screenImage := vncConn.Canvas
 
+	// Configure encodings on the VNC canvas for rendering.
 	for _, enc := range ccflags.Encodings {
-		myRenderer, ok := enc.(vnc.Renderer)
-
-		if ok {
-			myRenderer.SetTargetImage(screenImage)
+		if renderer, ok := enc.(vnc.Renderer); ok {
+			renderer.SetTargetImage(screenImage)
 		}
 	}
 
-	vncConnection.SetEncodings([]vnc.EncodingType{
+	// Tell the VNC server which encodings we prefer (order matters).
+	vncConn.SetEncodings([]vnc.EncodingType{
 		vnc.EncCursorPseudo,
 		vnc.EncPointerPosPseudo,
 		vnc.EncCopyRect,
@@ -219,260 +335,174 @@ func vcodecRun(vcodec *X264ImageCustomEncoder, c *cli.Context, outfileName strin
 		vnc.EncRRE,
 	})
 
-	go func() {
-		for {
-			timeStart := time.Now()
+	// --- Encoder setup ---
+	splitMode := c.Int("splitfile") > 0
+	outfileName := generateOutfileName(c.String("outfile"), splitMode)
+	vcodec := newEncoder(log, ffmpegPath, c.Int("framerate"), c.Int("crf"))
 
-			err := vcodec.Encode(screenImage.Image)
-			if err != nil {
-				errorCh2<-err
-				return
+	// Start ffmpeg in a goroutine (blocks until the process exits).
+	go vcodec.Run(outfileName + ".mp4")
+
+	// Frame capture goroutine: reads the VNC canvas and writes PPM frames
+	// to ffmpeg at the configured framerate.
+	encoderErrCh := make(chan error, 1)
+	stopEncoding := make(chan struct{})
+	go encodeFrames(vcodec, screenImage, stopEncoding, encoderErrCh)
+
+	// Split ticker: fires every N minutes to rotate the output file.
+	// A nil channel (<-chan time.Time) in a select is never ready, which is
+	// exactly what we want when split mode is disabled.
+	var splitTicker *time.Ticker
+	var splitTickerCh <-chan time.Time
+	if splitMode {
+		splitTicker = time.NewTicker(time.Duration(c.Int("splitfile")) * time.Minute)
+		defer splitTicker.Stop()
+		splitTickerCh = splitTicker.C
+	}
+
+	// Framebuffer update stats (logged at TRACE level).
+	frameBufferReq := 0
+	statsStart := time.Now()
+
+	// --- Main event loop ---
+	for {
+		select {
+		case <-ctx.Done():
+			// Graceful shutdown: close encoder, wait for ffmpeg, upload.
+			close(stopEncoding)
+			vcodec.Close()
+			vcodec.Wait()
+			if uploader != nil {
+				uploader.upload(outfileName)
+			}
+			return nil
+
+		case err := <-errorCh:
+			// VNC connection error. Close everything and return to the
+			// reconnection loop. Resolution changes (EOF) are handled
+			// the same way: reconnect to get the new resolution.
+			close(stopEncoding)
+			vcodec.Close()
+			vcodec.Wait()
+			if uploader != nil {
+				go uploader.upload(outfileName)
+			}
+			if isResolutionChange(err) {
+				log.Warnf("resolution change detected, will reconnect: %v", err)
+			} else {
+				log.Errorf("VNC connection error: %v", err)
+			}
+			return fmt.Errorf("VNC error: %w", err)
+
+		case err := <-encoderErrCh:
+			// Encoder (ffmpeg) error. Save what we can and reconnect.
+			close(stopEncoding)
+			vcodec.Close()
+			vcodec.Wait()
+			if uploader != nil {
+				go uploader.upload(outfileName)
+			}
+			log.Errorf("encoder error: %v", err)
+			return fmt.Errorf("encoder error: %w", err)
+
+		case <-splitTickerCh:
+			// File rotation: close current encoder, start a new one.
+			// The VNC connection stays alive — no reconnection needed.
+			log.Infof("split interval reached, rotating output file")
+			close(stopEncoding)
+			vcodec.Close()
+			vcodec.Wait()
+
+			// Upload the completed file in the background.
+			if uploader != nil {
+				go uploader.upload(outfileName)
 			}
 
-			timeTarget := timeStart.Add((1000 / time.Duration(vcodec.Framerate)) * time.Millisecond)
-			timeLeft := timeTarget.Sub(time.Now())
-			if timeLeft > 0 {
-				time.Sleep(timeLeft)
+			// Create new encoder for the next segment.
+			outfileName = generateOutfileName(c.String("outfile"), true)
+			vcodec = newEncoder(log, ffmpegPath, c.Int("framerate"), c.Int("crf"))
+			go vcodec.Run(outfileName + ".mp4")
+
+			// Restart frame capture with fresh channels.
+			stopEncoding = make(chan struct{})
+			encoderErrCh = make(chan error, 1)
+			go encodeFrames(vcodec, screenImage, stopEncoding, encoderErrCh)
+
+		case msg := <-cchClient:
+			log.Debugf("client message: type=%d", msg.Type())
+
+		case msg := <-cchServer:
+			if msg.Type() == vnc.FramebufferUpdateMsgType {
+				frameBufferReq++
+				elapsed := time.Since(statsStart).Seconds()
+				reqPerSec := float64(frameBufferReq) / elapsed
+				log.Tracef("framebuffer update #%d (%.1f req/s)", frameBufferReq, reqPerSec)
+
+				// Request the next framebuffer update from the server.
+				reqMsg := vnc.FramebufferUpdateRequest{
+					Inc: 1, X: 0, Y: 0,
+					Width:  vncConn.Width(),
+					Height: vncConn.Height(),
+				}
+				reqMsg.Write(vncConn)
 			}
 		}
-	}()
+	}
+}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh,
-		os.Interrupt,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT,
-		syscall.SIGKILL,
-	)
-
-	frameBufferReq := 0
-	timeStart := time.Now()
+// encodeFrames runs in a goroutine, encoding VNC screen frames at the
+// configured framerate. It stops when the stop channel is closed or
+// when an encoding error occurs (sent to errCh).
+func encodeFrames(vcodec *X264ImageCustomEncoder, screenImage *vnc.VncCanvas, stop <-chan struct{}, errCh chan<- error) {
+	frameDuration := time.Second / time.Duration(vcodec.Framerate)
 
 	for {
 		select {
-		case err := <-errorCh:
-			if strings.Contains(err.Error(), "EOF") {
-				logrus.WithField("error", err).Error("Received EOF, maybe a resolution change.")
-				vcodec.Close()
-				videoUpload(c, outfileName)
-				panic(err)
-			} else {
-				panic(err)
-			}
-		case err := <-errorCh2:
-			logrus.WithField("error", err).Error("Encoded error received.")
-			vcodec.Close()
-			videoUpload(c, outfileName)
-		case msg := <-cchClient:
-			logrus.WithFields(logrus.Fields{
-				"messageType": msg.Type(),
-				"message":     msg,
-			}).Debug("client message received.")
-		case msg := <-cchServer:
-			if msg.Type() == vnc.FramebufferUpdateMsgType {
-				secsPassed := time.Now().Sub(timeStart).Seconds()
-				frameBufferReq++
-				reqPerSec := float64(frameBufferReq) / secsPassed
-				logrus.WithFields(logrus.Fields{
-					"reqs":           frameBufferReq,
-					"seconds":        secsPassed,
-					"Req Per second": reqPerSec,
-				}).Debug("framebuffer update")
-
-				reqMsg := vnc.FramebufferUpdateRequest{Inc: 1, X: 0, Y: 0, Width: vncConnection.Width(), Height: vncConnection.Height()}
-				reqMsg.Write(vncConnection)
-			}
-		case signal := <-sigCh:
-			if signal != nil {
-				logrus.WithField("signal", signal).Info("signal received.")
-				vcodec.Close()
-				os.Exit(0)
-			}
-		}
-	}
-}
-
-func procBucketName(s string) string {
-	// Get the current year, month, and day.
-	now := time.Now()
-	year := now.Year()
-	month := int(now.Month())
-	day := now.Day()
-
-	// Replace {YEAR}, {MONTH}, and {DAY} placeholders in the string with the corresponding values.
-	s = strings.ReplaceAll(s, "{YEAR}", fmt.Sprintf("%d", year))
-	s = strings.ReplaceAll(s, "{MONTH}", fmt.Sprintf("%02d", month))
-	s = strings.ReplaceAll(s, "{DAY}", fmt.Sprintf("%02d", day))
-
-	return s
-}
-
-func videoUpload(c *cli.Context, outfileName string) error {
-	var minioClient *minio.Client
-	var err error
-	if c.String("s3_endpoint") != "" {
-		if c.Int("splitfile") == 0 {
-			return errors.New("If you want to upload videos to S3, you need to split files.")
-		}
-		minioClient, err = minio.New(c.String("s3_endpoint"), &minio.Options{
-			Creds:  credentials.NewStaticV4(c.String("s3_accessKeyID"), c.String("s3_secretAccessKey"), ""),
-			Secure: c.Bool("s3_ssl"),
-		})
-		if err != nil {
-			return err
-		}
-	}
-	time.Sleep(10 * time.Second)
-	if c.String("s3_endpoint") != "" {
-		found, err := minioClient.BucketExists(context.Background(), procBucketName(c.String("s3_bucketName")))
-		if err != nil {
-			logrus.Error("minioClient.BucketExists", err)
-			return err
-		}
-		if ! found {
-			err = minioClient.MakeBucket(context.Background(), procBucketName(c.String("s3_bucketName")), minio.MakeBucketOptions{Region: c.String("s3_region")})
-			if err != nil {
-				logrus.Error("minioClient.MakeBucket", err)
-				return err
-			}
-		}
-		file, err := os.Open(outfileName + ".mp4")
-		if err != nil {
-			logrus.Error("os.Open", err)
-			return err
+		case <-stop:
+			return
+		default:
 		}
 
-		fileStat, err := file.Stat()
-		if err != nil {
-			logrus.Error("fileStat", err)
-			file.Close()
-			return err
-		}
+		timeStart := time.Now()
 
-		uploadInfo, err := minioClient.PutObject(context.Background(), procBucketName(c.String("s3_bucketName")), outfileName + ".mp4", file, fileStat.Size(), minio.PutObjectOptions{ContentType:"application/octet-stream"})
-		if err != nil {
-			logrus.Error("minioClient.PutObject", err)
-			file.Close()
-			return err
-		} else {
-			file.Close()
-			os.Remove(outfileName + ".mp4")
-		}
-		logrus.Debug("Successfully uploaded bytes: ", uploadInfo)
-	}
-	return nil
-}
-
-func recorder(c *cli.Context) error {
-	if c.Bool("debug") {
-		logrus.SetReportCaller(true)
-	}
-
-	var minioClient *minio.Client
-
-	var outfileName string
-	outfile := c.String("outfile")
-
-	if c.Int("splitfile") > 0 {
-		t := time.Now()
-		outfileName = outfile + "-" + strconv.Itoa(t.Year()) + "-" + strconv.Itoa(int(t.Month())) + "-" + strconv.Itoa(t.Day()) + "-" + strconv.Itoa(t.Hour()) + "-" + strconv.Itoa(t.Minute())
-	} else {
-		outfileName = outfile
-	}
-
-	ffmpegPath, err := exec.LookPath(c.String("ffmpeg"))
-	if err != nil {
-		logrus.WithError(err).Error("ffmpeg binary not found.")
-		return err
-	}
-	logrus.WithField("ffmpeg", ffmpegPath).Info("ffmpeg binary for recording found")
-
-	vcodec := &X264ImageCustomEncoder{
-		FFMpegBinPath:      ffmpegPath,
-		Framerate:          c.Int("framerate"),
-		ConstantRateFactor: c.Int("crf"),
-	}
-
-	if c.String("s3_endpoint") != "" {
-		if c.Int("splitfile") == 0 {
-			return errors.New("If you want to upload videos to S3, you need to split files.")
-		}
-		minioClient, err = minio.New(c.String("s3_endpoint"), &minio.Options{
-			Creds:  credentials.NewStaticV4(c.String("s3_accessKeyID"), c.String("s3_secretAccessKey"), ""),
-			Secure: c.Bool("s3_ssl"),
-		})
-		if err != nil {
-			return err
-		}
-	}
-	if c.Int("splitfile") > 0 {
-		ticker := time.NewTicker(time.Duration(c.Int("splitfile")) * time.Minute)
-
-		go func() {
-			for {
-				vcodecRun(vcodec, c, outfileName)
-			}
-		}()
-		for {
+		if err := vcodec.Encode(screenImage.Image); err != nil {
+			// Non-blocking send: if errCh is full, the error is already reported.
 			select {
-			case _ = <-ticker.C:
-				vcodec.Close()
-				go func(outfileName string) {
-					time.Sleep(10 * time.Second)
-					if c.String("s3_endpoint") != "" {
-						found, err := minioClient.BucketExists(context.Background(), procBucketName(c.String("s3_bucketName")))
-						if err != nil {
-							logrus.Error("minioClient.BucketExists", err)
-							return
-						}
-						if ! found {
-							err = minioClient.MakeBucket(context.Background(), procBucketName(c.String("s3_bucketName")), minio.MakeBucketOptions{Region: c.String("s3_region")})
-							if err != nil {
-								logrus.Error("minioClient.MakeBucket", err)
-								return
-							}
-						}
-						file, err := os.Open(outfileName + ".mp4")
-						if err != nil {
-							logrus.Error("os.Open", err)
-							return
-						}
-
-						fileStat, err := file.Stat()
-						if err != nil {
-							logrus.Error("fileStat", err)
-							file.Close()
-							return
-						}
-
-						uploadInfo, err := minioClient.PutObject(context.Background(), procBucketName(c.String("s3_bucketName")), outfileName + ".mp4", file, fileStat.Size(), minio.PutObjectOptions{ContentType:"application/octet-stream"})
-						if err != nil {
-							logrus.Error("minioClient.PutObject", err)
-							file.Close()
-							return
-						} else {
-							file.Close()
-							os.Remove(outfileName + ".mp4")
-						}
-						logrus.Debug("Successfully uploaded bytes: ", uploadInfo)
-					}
-				}(outfileName)
-				t := time.Now()
-				outfileName = outfile + "-" + strconv.Itoa(t.Year()) + "-" + strconv.Itoa(int(t.Month())) + "-" + strconv.Itoa(t.Day()) + "-" + strconv.Itoa(t.Hour()) + "-" + strconv.Itoa(t.Minute())
-				vcodec = &X264ImageCustomEncoder{
-					FFMpegBinPath:      ffmpegPath,
-					Framerate:          c.Int("framerate"),
-					ConstantRateFactor: c.Int("crf"),
-				}
-				go vcodecRun(vcodec, c, outfileName)
+			case errCh <- err:
+			default:
 			}
+			return
 		}
 
-	} else {
-		vcodecRun(vcodec, c, outfileName)
+		// Sleep for the remaining frame interval to maintain consistent framerate.
+		elapsed := time.Since(timeStart)
+		if wait := frameDuration - elapsed; wait > 0 {
+			time.Sleep(wait)
+		}
 	}
+}
 
-	return nil
+// generateOutfileName creates an output filename, optionally appending a
+// timestamp for split mode. Format: "base-YYYY-MM-DD-HH-MM".
+func generateOutfileName(base string, withTimestamp bool) string {
+	if !withTimestamp {
+		return base
+	}
+	t := time.Now()
+	return fmt.Sprintf("%s-%04d-%02d-%02d-%02d-%02d",
+		base, t.Year(), int(t.Month()), t.Day(), t.Hour(), t.Minute())
+}
+
+// isResolutionChange detects VNC resolution changes, which manifest as
+// EOF errors from the VNC library when the framebuffer size changes.
+func isResolutionChange(err error) bool {
+	return strings.Contains(err.Error(), "EOF")
+}
+
+// minDuration returns the smaller of two durations.
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
