@@ -1,0 +1,61 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release:
+    name: Create semver release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: latest_tag
+        run: |
+          tag=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          if [ -z "$tag" ]; then
+            tag="v0.0.0"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: $tag"
+
+      - name: Calculate next version
+        id: next_version
+        run: |
+          current="${{ steps.latest_tag.outputs.tag }}"
+          current="${current#v}"
+          IFS='.' read -r major minor patch <<< "$current"
+
+          msg=$(git log -1 --pretty=%B)
+
+          if echo "$msg" | grep -qiE '^(BREAKING CHANGE|feat!|fix!|refactor!)'; then
+            major=$((major + 1))
+            minor=0
+            patch=0
+          elif echo "$msg" | grep -qiE '^feat'; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+          fi
+
+          version="v${major}.${minor}.${patch}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Next version: $version"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.next_version.outputs.version }}"
+          gh release create "$version" \
+            --target "${{ github.sha }}" \
+            --title "$version" \
+            --generate-notes

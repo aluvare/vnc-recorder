@@ -38,7 +38,7 @@ import (
 	"time"
 
 	vnc "github.com/amitbet/vnc2video"
-	"github.com/saily/vnc-recorder/logging"
+	"github.com/aluvare/vnc-recorder/logging"
 	"github.com/urfave/cli/v2"
 )
 

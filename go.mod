@@ -1,4 +1,4 @@
-module github.com/saily/vnc-recorder
+module github.com/aluvare/vnc-recorder
 
 go 1.21
 

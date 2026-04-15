@@ -30,7 +30,7 @@ import (
 
 	vnc "github.com/amitbet/vnc2video"
 	"github.com/amitbet/vnc2video/encoders"
-	"github.com/saily/vnc-recorder/logging"
+	"github.com/aluvare/vnc-recorder/logging"
 )
 
 // X264ImageCustomEncoder wraps ffmpeg to encode a stream of PPM images into

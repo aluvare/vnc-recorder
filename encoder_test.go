@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/saily/vnc-recorder/logging"
+	"github.com/aluvare/vnc-recorder/logging"
 )
 
 // newTestEncoderLogger creates a logger for encoder tests.

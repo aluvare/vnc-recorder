@@ -19,7 +19,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/saily/vnc-recorder/logging"
+	"github.com/aluvare/vnc-recorder/logging"
 	"github.com/urfave/cli/v2"
 )
 
